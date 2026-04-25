@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+venv/
+env/
+.venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ChromaDB index (generated, not source)
+.chroma_resume_index/
+chroma_db/
+
+# Output files
+output_matches.json
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Secrets / API keys
+.env
+*.env
+secrets.json
+
+# Data files (resumes/JDs may be sensitive)
+data/resumes/
+data/job_descriptions/

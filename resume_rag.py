@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -20,7 +21,6 @@ try:
     import docx  # python-docx
 except Exception:  # pragma: no cover - optional dependency at runtime
     docx = None
-
 
 SECTION_PATTERNS = [
     "summary",
@@ -59,6 +59,18 @@ SKILL_VOCAB = [
     "tableau",
 ]
 
+# OPTIMIZATION: Pre-compile regular expressions globally
+HEADING_PATTERN = re.compile(r"^[A-Za-z][A-Za-z &/()\-]{2,40}$")
+
+EXPERIENCE_PATTERNS = [
+    re.compile(r"(\d+)\+?\s*(?:years|yrs)\s+of\s+experience"),
+    re.compile(r"experience\s*[:\-]?\s*(\d+)\+?\s*(?:years|yrs)"),
+    re.compile(r"(\d+)\+?\s*(?:years|yrs)\s+experience"),
+]
+
+SKILL_PATTERNS = {
+    skill: re.compile(rf"\b{re.escape(skill)}\b") for skill in SKILL_VOCAB
+}
 
 @dataclass
 class ResumeChunk:
@@ -66,10 +78,8 @@ class ResumeChunk:
     text: str
     metadata: Dict[str, str]
 
-
 def read_text_file(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
-
 
 def read_pdf_file(path: Path) -> str:
     if PdfReader is None:
@@ -78,13 +88,11 @@ def read_pdf_file(path: Path) -> str:
     pages = [page.extract_text() or "" for page in reader.pages]
     return "\n".join(pages)
 
-
 def read_docx_file(path: Path) -> str:
     if docx is None:
         raise RuntimeError("python-docx is not installed. Install with: pip install python-docx")
     document = docx.Document(str(path))
     return "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
-
 
 def load_resume_text(path: Path) -> str:
     suffix = path.suffix.lower()
@@ -96,41 +104,43 @@ def load_resume_text(path: Path) -> str:
         return read_docx_file(path)
     raise ValueError(f"Unsupported file format: {path.name}")
 
-
 def iter_resume_files(resume_dir: Path) -> Iterable[Path]:
     for extension in ("*.pdf", "*.docx", "*.doc", "*.txt"):
         yield from resume_dir.rglob(extension)
 
-
 def normalize_spaces(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
-
 
 def split_sections(text: str) -> List[Tuple[str, str]]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     sections: List[Tuple[str, List[str]]] = [("general", [])]
-    heading_pattern = re.compile(r"^[A-Za-z][A-Za-z &/()\-]{2,40}$")
-
+    
     for line in lines:
         lower_line = line.lower()
-        looks_like_heading = heading_pattern.match(line) and any(key in lower_line for key in SECTION_PATTERNS)
+        # OPTIMIZATION: Use globally pre-compiled HEADING_PATTERN
+        looks_like_heading = HEADING_PATTERN.match(line) and any(key in lower_line for key in SECTION_PATTERNS)
+        
         if looks_like_heading:
             sections.append((lower_line, []))
         else:
             sections[-1][1].append(line)
-
+            
     output: List[Tuple[str, str]] = []
     for section_name, section_lines in sections:
         if section_lines:
             output.append((section_name, "\n".join(section_lines)))
     return output
 
-
-def chunk_section_text(section_name: str, section_text: str, max_chars: int = 950, overlap_chars: int = 180) -> List[str]:
+def chunk_section_text(
+    section_name: str,
+    section_text: str,
+    max_chars: int = 950,
+    overlap_chars: int = 180
+) -> List[str]:
     section_text = normalize_spaces(section_text)
     if len(section_text) <= max_chars:
         return [f"[{section_name}] {section_text}"]
-
+        
     chunks: List[str] = []
     start = 0
     while start < len(section_text):
@@ -142,68 +152,59 @@ def chunk_section_text(section_name: str, section_text: str, max_chars: int = 95
         start = max(0, end - overlap_chars)
     return chunks
 
-
 def extract_name(text: str, fallback_stem: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return fallback_stem.replace("_", " ").title()
+        
     first_line = lines[0]
     if len(first_line.split()) <= 5 and not any(char.isdigit() for char in first_line):
         return first_line
     return fallback_stem.replace("_", " ").title()
 
-
-def extract_experience_years(text: str) -> int:
-    lowered = text.lower()
-    patterns = [
-        r"(\d+)\+?\s*(?:years|yrs)\s+of\s+experience",
-        r"experience\s*[:\-]?\s*(\d+)\+?\s*(?:years|yrs)",
-        r"(\d+)\+?\s*(?:years|yrs)\s+experience",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, lowered)
+# OPTIMIZATION: Pass lowered text to prevent redundant string manipulation
+def extract_experience_years(lowered_text: str) -> int:
+    for pattern in EXPERIENCE_PATTERNS:
+        match = pattern.search(lowered_text)
         if match:
             return int(match.group(1))
     return 0
 
-
-def extract_education(text: str) -> str:
-    lowered = text.lower()
-    if "phd" in lowered:
+def extract_education(lowered_text: str) -> str:
+    if "phd" in lowered_text:
         return "PhD"
-    if "master" in lowered or "m.tech" in lowered or "mba" in lowered:
+    if "master" in lowered_text or "m.tech" in lowered_text or "mba" in lowered_text:
         return "Masters"
-    if "bachelor" in lowered or "b.tech" in lowered or "b.e" in lowered:
+    if "bachelor" in lowered_text or "b.tech" in lowered_text or "b.e" in lowered_text:
         return "Bachelors"
     return "Not Specified"
 
-
-def extract_skills(text: str) -> List[str]:
-    lowered = text.lower()
+def extract_skills(lowered_text: str) -> List[str]:
     matched = []
-    for skill in SKILL_VOCAB:
-        if re.search(rf"\b{re.escape(skill)}\b", lowered):
+    for skill, pattern in SKILL_PATTERNS.items():
+        if pattern.search(lowered_text):
             matched.append(skill.title())
     return sorted(set(matched))
 
-
 def build_resume_metadata(path: Path, text: str) -> Dict[str, str]:
-    skills = extract_skills(text)
+    # OPTIMIZATION: Lowercase the text once and pass it to all extractors
+    lowered_text = text.lower()
+    skills = extract_skills(lowered_text)
+    
     metadata: Dict[str, str] = {
         "candidate_name": extract_name(text, path.stem),
         "resume_path": str(path.as_posix()),
         "skills": ",".join(skills),
-        "experience_years": str(extract_experience_years(text)),
-        "education": extract_education(text),
+        "experience_years": str(extract_experience_years(lowered_text)),
+        "education": extract_education(lowered_text),
     }
     return metadata
-
 
 def build_resume_chunks(path: Path, text: str) -> List[ResumeChunk]:
     sections = split_sections(text)
     base_metadata = build_resume_metadata(path, text)
+    
     output: List[ResumeChunk] = []
-
     for section_name, section_text in sections:
         for chunk_text in chunk_section_text(section_name, section_text):
             chunk_id = str(uuid.uuid4())
@@ -211,24 +212,42 @@ def build_resume_chunks(path: Path, text: str) -> List[ResumeChunk]:
                 **base_metadata,
                 "section": section_name,
             }
-            output.append(ResumeChunk(chunk_id=chunk_id, text=chunk_text, metadata=metadata))
+            output.append(ResumeChunk(
+                chunk_id=chunk_id,
+                text=chunk_text,
+                metadata=metadata
+            ))
     return output
 
-
-def get_embedding_function(provider: str, model_name: str, api_key: Optional[str]) -> object:
+def get_embedding_function(
+    provider: str,
+    model_name: str,
+    api_key: Optional[str]
+) -> object:
     provider = provider.lower()
+    
     if provider == "openai":
         if not api_key:
             raise ValueError("OPENAI_API_KEY is required for provider=openai")
-        return embedding_functions.OpenAIEmbeddingFunction(api_key=api_key, model_name=model_name)
+        return embedding_functions.OpenAIEmbeddingFunction(
+            api_key=api_key,
+            model_name=model_name
+        )
+        
     if provider == "cohere":
         if not api_key:
             raise ValueError("COHERE_API_KEY is required for provider=cohere")
-        return embedding_functions.CohereEmbeddingFunction(api_key=api_key, model_name=model_name)
+        return embedding_functions.CohereEmbeddingFunction(
+            api_key=api_key,
+            model_name=model_name
+        )
+        
     if provider == "huggingface":
-        return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model_name)
+        return embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=model_name
+        )
+        
     raise ValueError("Unsupported provider. Use one of: openai, cohere, huggingface")
-
 
 def get_or_create_collection(
     chroma_path: Path,
@@ -236,21 +255,29 @@ def get_or_create_collection(
     embedding_function: object,
 ) -> Collection:
     client = chromadb.PersistentClient(path=str(chroma_path))
-    collection = client.get_or_create_collection(name=collection_name, embedding_function=embedding_function)
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        embedding_function=embedding_function
+    )
     return collection
-
 
 def upsert_chunks(collection: Collection, chunks: Sequence[ResumeChunk]) -> None:
     if not chunks:
         return
+        
     collection.upsert(
         ids=[chunk.chunk_id for chunk in chunks],
         documents=[chunk.text for chunk in chunks],
         metadatas=[chunk.metadata for chunk in chunks],
     )
 
-
-def write_summary(summary_path: Path, resume_count: int, chunk_count: int, collection_name: str, chroma_path: Path) -> None:
+def write_summary(
+    summary_path: Path,
+    resume_count: int,
+    chunk_count: int,
+    collection_name: str,
+    chroma_path: Path
+) -> None:
     summary = {
         "resumes_indexed": resume_count,
         "chunks_indexed": chunk_count,
@@ -258,7 +285,6 @@ def write_summary(summary_path: Path, resume_count: int, chunk_count: int, colle
         "vector_store_path": str(chroma_path.as_posix()),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build resume RAG index with ChromaDB")
@@ -272,28 +298,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-path", default="rag_index_summary.json")
     return parser.parse_args()
 
+# OPTIMIZATION: Helper function for parallel processing
+def process_single_resume(resume_path: Path) -> List[ResumeChunk]:
+    try:
+        text = load_resume_text(resume_path)
+        return build_resume_chunks(resume_path, text)
+    except Exception as e:
+        print(f"Error processing {resume_path.name}: {e}")
+        return []
 
 def main() -> None:
     args = parse_args()
+    
     resume_dir = Path(args.resume_dir)
     if not resume_dir.exists():
         raise FileNotFoundError(f"Resume directory not found: {resume_dir}")
-
+        
     api_key = args.openai_api_key if args.embedding_provider == "openai" else args.cohere_api_key
-    embedding_function = get_embedding_function(args.embedding_provider, args.embedding_model, api_key)
-    collection = get_or_create_collection(Path(args.chroma_path), args.collection, embedding_function)
-
+    embedding_function = get_embedding_function(
+        args.embedding_provider,
+        args.embedding_model,
+        api_key
+    )
+    
+    collection = get_or_create_collection(
+        Path(args.chroma_path),
+        args.collection,
+        embedding_function
+    )
+    
     resume_paths = list(iter_resume_files(resume_dir))
     if not resume_paths:
         raise RuntimeError(f"No supported resume files found in {resume_dir}")
-
-    total_chunks = 0
-    for resume_path in resume_paths:
-        text = load_resume_text(resume_path)
-        chunks = build_resume_chunks(resume_path, text)
-        upsert_chunks(collection, chunks)
-        total_chunks += len(chunks)
-
+        
+    # OPTIMIZATION: Process files in parallel using ThreadPoolExecutor
+    all_chunks = []
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = executor.map(process_single_resume, resume_paths)
+        for chunks in results:
+            all_chunks.extend(chunks)
+            
+    total_chunks = len(all_chunks)
+    
+    # OPTIMIZATION: Batch upsert into ChromaDB (500 items per batch)
+    BATCH_SIZE = 500
+    for i in range(0, total_chunks, BATCH_SIZE):
+        batch = all_chunks[i:i + BATCH_SIZE]
+        upsert_chunks(collection, batch)
+        
     write_summary(
         summary_path=Path(args.summary_path),
         resume_count=len(resume_paths),
@@ -301,8 +353,8 @@ def main() -> None:
         collection_name=args.collection,
         chroma_path=Path(args.chroma_path),
     )
+    
     print(f"Indexed {len(resume_paths)} resumes into {args.collection} with {total_chunks} chunks.")
-
 
 if __name__ == "__main__":
     main()
